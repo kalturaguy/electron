@@ -10,7 +10,9 @@
 
 #include "atom/common/api/api_messages.h"
 #include "atom/common/native_mate_converters/string16_converter.h"
+#include "atom/common/native_mate_converters/v8_value_converter.h"
 #include "atom/common/native_mate_converters/value_converter.h"
+#include "atom/common/node_includes.h"
 #include "atom/common/options_switches.h"
 #include "atom/renderer/api/atom_api_renderer_ipc.h"
 #include "atom/renderer/atom_render_view_observer.h"
@@ -21,6 +23,8 @@
 #include "content/public/renderer/render_view.h"
 #include "content/public/renderer/render_view_observer.h"
 #include "ipc/ipc_message_macros.h"
+#include "native_mate/converter.h"
+#include "native_mate/dictionary.h"
 #include "third_party/WebKit/public/web/WebFrame.h"
 #include "third_party/WebKit/public/web/WebKit.h"
 #include "third_party/WebKit/public/web/WebLocalFrame.h"
@@ -31,7 +35,57 @@ namespace atom {
 
 namespace {
 
-const std::string kBindingKey = "binding";
+const std::string kIpcKey = "ipcNative";
+const std::string kModuleCacheKey = "native-module-cache";
+
+
+v8::Local<v8::Object> GetModuleCache(v8::Isolate* isolate) {
+  mate::Dictionary global(isolate, isolate->GetCurrentContext()->Global());
+  v8::Local<v8::Value> cache;
+
+  if (!global.GetHidden(kModuleCacheKey, &cache)) {
+    cache = v8::Object::New(isolate);
+    global.SetHidden(kModuleCacheKey, cache);
+  }
+
+  return cache->ToObject();
+}
+
+// adapted from node.cc
+v8::Local<v8::Value> GetBinding(v8::Isolate* isolate, v8::Local<v8::String> key,
+    mate::Arguments* margs) {
+  v8::Local<v8::Object> exports;
+  std::string module_key = mate::V8ToString(key);
+  mate::Dictionary cache(isolate, GetModuleCache(isolate));
+
+  if (cache.Get(module_key.c_str(), &exports)) {
+    return exports;
+  }
+
+  auto mod = node::get_builtin_module(module_key.c_str());
+
+  if (!mod) {
+    char errmsg[1024];
+    snprintf(errmsg, sizeof(errmsg), "No such module: %s", module_key.c_str());
+    margs->ThrowError(errmsg);
+    return exports;
+  }
+
+  exports = v8::Object::New(isolate);
+  DCHECK_EQ(mod->nm_register_func, nullptr);
+  DCHECK_NE(mod->nm_context_register_func, nullptr);
+  mod->nm_context_register_func(exports, v8::Null(isolate),
+      isolate->GetCurrentContext(), mod->nm_priv);
+  cache.Set(module_key.c_str(), exports);
+  return exports;
+}
+
+void InitializeBindings(v8::Local<v8::Object> binding,
+                        v8::Local<v8::Context> context) {
+  auto isolate = context->GetIsolate();
+  mate::Dictionary b(isolate, binding);
+  b.SetMethod("get", GetBinding);
+}
 
 class AtomSandboxedRenderFrameObserver : public content::RenderFrameObserver {
  public:
@@ -82,7 +136,9 @@ class AtomSandboxedRenderViewObserver : public AtomRenderViewObserver {
   AtomSandboxedRenderViewObserver(content::RenderView* render_view,
                                   AtomSandboxedRendererClient* renderer_client)
     : AtomRenderViewObserver(render_view, nullptr),
+    v8_converter_(new atom::V8ValueConverter),
     renderer_client_(renderer_client) {
+      v8_converter_->SetDisableNode(true);
     }
 
  protected:
@@ -98,15 +154,16 @@ class AtomSandboxedRenderViewObserver : public AtomRenderViewObserver {
     v8::Context::Scope context_scope(context);
     v8::Local<v8::Value> argv[] = {
       mate::ConvertToV8(isolate, channel),
-      mate::ConvertToV8(isolate, args)
+      v8_converter_->ToV8Value(&args, context)
     };
-    renderer_client_->InvokeBindingCallback(
+    renderer_client_->InvokeIpcCallback(
         context,
         "onMessage",
         std::vector<v8::Local<v8::Value>>(argv, argv + 2));
   }
 
  private:
+  std::unique_ptr<atom::V8ValueConverter> v8_converter_;
   AtomSandboxedRendererClient* renderer_client_;
   DISALLOW_COPY_AND_ASSIGN(AtomSandboxedRenderViewObserver);
 };
@@ -158,17 +215,13 @@ void AtomSandboxedRendererClient::DidCreateScriptContext(
       script->Run(context).ToLocalChecked());
   // Create and initialize the binding object
   auto binding = v8::Object::New(isolate);
-  api::Initialize(binding, v8::Null(isolate), context, nullptr);
+  InitializeBindings(binding, context);
   v8::Local<v8::Value> args[] = {
     binding,
     mate::ConvertToV8(isolate, preload_script)
   };
   // Execute the function with proper arguments
   ignore_result(func->Call(context, v8::Null(isolate), 2, args));
-  // Store the bindingt privately for handling messages from the main process.
-  auto binding_key = mate::ConvertToV8(isolate, kBindingKey)->ToString();
-  auto private_binding_key = v8::Private::ForApi(isolate, binding_key);
-  context->Global()->SetPrivate(context, private_binding_key, binding);
 }
 
 void AtomSandboxedRendererClient::WillReleaseScriptContext(
@@ -176,15 +229,15 @@ void AtomSandboxedRendererClient::WillReleaseScriptContext(
   auto isolate = context->GetIsolate();
   v8::HandleScope handle_scope(isolate);
   v8::Context::Scope context_scope(context);
-  InvokeBindingCallback(context, "onExit", std::vector<v8::Local<v8::Value>>());
+  InvokeIpcCallback(context, "onExit", std::vector<v8::Local<v8::Value>>());
 }
 
-void AtomSandboxedRendererClient::InvokeBindingCallback(
+void AtomSandboxedRendererClient::InvokeIpcCallback(
     v8::Handle<v8::Context> context,
     std::string callback_name,
     std::vector<v8::Handle<v8::Value>> args) {
   auto isolate = context->GetIsolate();
-  auto binding_key = mate::ConvertToV8(isolate, kBindingKey)->ToString();
+  auto binding_key = mate::ConvertToV8(isolate, kIpcKey)->ToString();
   auto private_binding_key = v8::Private::ForApi(isolate, binding_key);
   auto global_object = context->Global();
   v8::Local<v8::Value> value;

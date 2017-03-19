@@ -1086,13 +1086,13 @@ describe('<webview> tag', function () {
       assert.equal(visibilityState, 'hidden')
       assert.equal(hidden, true)
 
-      w.webContents.send('ELECTRON_RENDERER_WINDOW_VISIBILITY_CHANGE', 'visible')
-
       ipcMain.once('pong', function (event, visibilityState, hidden) {
         assert.equal(visibilityState, 'visible')
         assert.equal(hidden, false)
         done()
       })
+
+      w.webContents.emit('-window-visibility-change', 'visible')
     })
 
     w.loadURL('file://' + fixtures + '/pages/webview-visibilitychange.html')
@@ -1600,6 +1600,20 @@ describe('<webview> tag', function () {
         if (final) done()
       })
       w.loadURL(`file://${fixtures}/pages/webview-in-page-navigate.html`)
+    })
+
+    it('inherits zoom level for the origin when available', (done) => {
+      w = new BrowserWindow({
+        show: false,
+        webPreferences: {
+          zoomFactor: 1.2
+        }
+      })
+      ipcMain.once('webview-origin-zoom-level', (event, zoomLevel) => {
+        assert.equal(zoomLevel, 2.0)
+        done()
+      })
+      w.loadURL(`file://${fixtures}/pages/webview-origin-zoom-level.html`)
     })
   })
 })

@@ -8,6 +8,7 @@
 #include "atom/browser/atom_access_token_store.h"
 #include "atom/browser/atom_browser_client.h"
 #include "atom/browser/atom_browser_context.h"
+#include "atom/browser/atom_web_ui_controller_factory.h"
 #include "atom/browser/bridge_task_runner.h"
 #include "atom/browser/browser.h"
 #include "atom/browser/javascript_environment.h"
@@ -132,6 +133,7 @@ void AtomBrowserMainParts::PostEarlyInitialization() {
   // Create the global environment.
   node::Environment* env =
       node_bindings_->CreateEnvironment(js_env_->context());
+  node_env_.reset(new NodeEnvironment(env));
 
   // Make sure node can get correct environment when debugging.
   if (node_debugger_->IsRunning())
@@ -164,6 +166,9 @@ void AtomBrowserMainParts::PreMainMessageLoopRun() {
       FROM_HERE, base::TimeDelta::FromMinutes(1),
       base::Bind(&v8::Isolate::LowMemoryNotification,
                  base::Unretained(js_env_->isolate())));
+
+  content::WebUIControllerFactory::RegisterFactory(
+      AtomWebUIControllerFactory::GetInstance());
 
   brightray::BrowserMainParts::PreMainMessageLoopRun();
   bridge_task_runner_->MessageLoopIsReady();
